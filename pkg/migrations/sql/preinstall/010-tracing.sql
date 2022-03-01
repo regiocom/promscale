@@ -317,9 +317,9 @@ BEGIN
             ALTER TABLE _ps_trace.event SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id', timescaledb.compress_orderby='span_id,time');
             ALTER TABLE _ps_trace.link SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id', timescaledb.compress_orderby='span_id,span_start_time');
 
-            PERFORM public.add_compression_policy('_ps_trace.span', INTERVAL '3 hours');
-            PERFORM public.add_compression_policy('_ps_trace.event', INTERVAL '3 hours');
-            PERFORM public.add_compression_policy('_ps_trace.link', INTERVAL '3 hours');
+            PERFORM public.add_compression_policy('_ps_trace.span', INTERVAL '1 hours');
+            PERFORM public.add_compression_policy('_ps_trace.event', INTERVAL '1 hours');
+            PERFORM public.add_compression_policy('_ps_trace.link', INTERVAL '1 hours');
         END IF;
     END IF;
 END;
