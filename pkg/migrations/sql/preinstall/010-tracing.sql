@@ -264,7 +264,7 @@ BEGIN
                 'start_time'::name,
                 partitioning_column=>'trace_id'::name,
                 number_partitions=>1::int,
-                chunk_time_interval=>'07:57:57.345608'::interval,
+                chunk_time_interval=>'1 hour'::interval,
                 create_default_indexes=>false
             );
             PERFORM public.create_distributed_hypertable(
@@ -272,7 +272,7 @@ BEGIN
                 'time'::name,
                 partitioning_column=>'trace_id'::name,
                 number_partitions=>1::int,
-                chunk_time_interval=>'07:59:53.649542'::interval,
+                chunk_time_interval=>'1 hour'::interval,
                 create_default_indexes=>false
             );
             PERFORM public.create_distributed_hypertable(
@@ -280,7 +280,7 @@ BEGIN
                 'span_start_time'::name,
                 partitioning_column=>'trace_id'::name,
                 number_partitions=>1::int,
-                chunk_time_interval=>'07:59:48.644258'::interval,
+                chunk_time_interval=>'1 hour'::interval,
                 create_default_indexes=>false
             );
             execute format('SET search_path = %s', _saved_search_path);
@@ -290,7 +290,7 @@ BEGIN
                 'start_time'::name,
                 partitioning_column=>'trace_id'::name,
                 number_partitions=>1::int,
-                chunk_time_interval=>'07:57:57.345608'::interval,
+                chunk_time_interval=>'1 hour'::interval,
                 create_default_indexes=>false
             );
             PERFORM public.create_hypertable(
@@ -298,7 +298,7 @@ BEGIN
                 'time'::name,
                 partitioning_column=>'trace_id'::name,
                 number_partitions=>1::int,
-                chunk_time_interval=>'07:59:53.649542'::interval,
+                chunk_time_interval=>'1 hour'::interval,
                 create_default_indexes=>false
             );
             PERFORM public.create_hypertable(
@@ -306,27 +306,20 @@ BEGIN
                 'span_start_time'::name,
                 partitioning_column=>'trace_id'::name,
                 number_partitions=>1::int,
-                chunk_time_interval=>'07:59:48.644258'::interval,
+                chunk_time_interval=>'1 hour'::interval,
                 create_default_indexes=>false
             );
         END IF;
 
         IF (NOT _is_timescaledb_oss) AND _is_compression_available THEN
             -- turn on compression
-            ALTER TABLE _ps_trace.span SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id,span_id');
-            ALTER TABLE _ps_trace.event SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id,span_id');
-            ALTER TABLE _ps_trace.link SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id,span_id');
+            ALTER TABLE _ps_trace.span SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id', timescaledb.compress_orderby='span_id,start_time');
+            ALTER TABLE _ps_trace.event SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id', timescaledb.compress_orderby='span_id,time');
+            ALTER TABLE _ps_trace.link SET (timescaledb.compress, timescaledb.compress_segmentby='trace_id', timescaledb.compress_orderby='span_id,span_start_time');
 
-            IF _timescaledb_major_version < 2 THEN
-                BEGIN
-                    PERFORM public.add_compression_policy('_ps_trace.span', INTERVAL '1 hour');
-                    PERFORM public.add_compression_policy('_ps_trace.event', INTERVAL '1 hour');
-                    PERFORM public.add_compression_policy('_ps_trace.link', INTERVAL '1 hour');
-                EXCEPTION
-                    WHEN undefined_function THEN
-                        RAISE NOTICE 'add_compression_policy does not exist';
-                END;
-            END IF;
+            PERFORM public.add_compression_policy('_ps_trace.span', INTERVAL '3 hours');
+            PERFORM public.add_compression_policy('_ps_trace.event', INTERVAL '3 hours');
+            PERFORM public.add_compression_policy('_ps_trace.link', INTERVAL '3 hours');
         END IF;
     END IF;
 END;
