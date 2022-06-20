@@ -7,13 +7,14 @@ package testhelpers
 import (
 	"context"
 	"fmt"
-	"github.com/blang/semver/v4"
 	"io"
 	"os"
 	"regexp"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/blang/semver/v4"
 
 	"github.com/docker/go-connections/nat"
 	"github.com/jackc/pgconn"

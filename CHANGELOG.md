@@ -13,6 +13,11 @@ We use the following categories for changes:
 - `Fixed` for any bug fixes.
 - `Security` in case of vulnerabilities.
 
+## Unreleased
+
+### Fixed
+- Fix RE2 regex support for label matching [#1441]
+
 ## [0.12.0] - 2022-06-21
 
 ### Added
