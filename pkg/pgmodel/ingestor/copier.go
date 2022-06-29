@@ -14,16 +14,22 @@ import (
 	"time"
 
 	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/timescale/promscale/pkg/log"
+	"github.com/timescale/promscale/pkg/pgmodel/common/schema"
 	"github.com/timescale/promscale/pkg/pgmodel/metrics"
 	pgmodel "github.com/timescale/promscale/pkg/pgmodel/model"
 	"github.com/timescale/promscale/pkg/pgxconn"
 	"github.com/timescale/promscale/pkg/tracer"
+)
+
+const (
+	sqlInsertIntoFrom = "INSERT INTO %[1]s.%[2]s(%[3]s) SELECT %[3]s FROM %[4]s ON CONFLICT DO NOTHING"
 )
 
 type copyRequest struct {
@@ -197,10 +203,20 @@ hot_gather:
 func doInsertOrFallback(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest) {
 	ctx, span := tracer.Default().Start(ctx, "do-insert-or-fallback")
 	defer span.End()
-	err, _ := insertSeries(ctx, conn, reqs...)
+	err, _ := insertSeries(ctx, conn, false, reqs...)
 	if err != nil {
-		insertBatchErrorFallback(ctx, conn, reqs...)
-		return
+		pgErr, ok := err.(*pgconn.PgError)
+		if ok && pgErr.Code == "23505" {
+			// unique violation
+			// we retry with onConflict
+			err = nil
+			err, _ = insertSeries(ctx, conn, true, reqs...)
+		}
+		if err != nil {
+			log.Error("msg", err)
+			insertBatchErrorFallback(ctx, conn, reqs...)
+			return
+		}
 	}
 
 	for i := range reqs {
@@ -213,7 +229,7 @@ func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, reqs ..
 	ctx, span := tracer.Default().Start(ctx, "insert-batch-error-fallback")
 	defer span.End()
 	for i := range reqs {
-		err, minTime := insertSeries(ctx, conn, reqs[i])
+		err, minTime := insertSeries(ctx, conn, false, reqs[i])
 		if err != nil {
 			err = tryRecovery(ctx, conn, err, reqs[i], minTime)
 		}
@@ -287,7 +303,7 @@ func retryAfterDecompression(ctx context.Context, conn pgxconn.PgxConn, req copy
 
 	metrics.IngestorDecompressCalls.With(prometheus.Labels{"type": "metric", "kind": "sample"}).Inc()
 	metrics.IngestorDecompressEarliest.With(prometheus.Labels{"type": "metric", "kind": "sample", "table": table}).Set(float64(minTime.UnixNano()) / 1e9)
-	err, _ := insertSeries(ctx, conn, req) // Attempt an insert again.
+	err, _ := insertSeries(ctx, conn, false, req) // Attempt an insert again.
 	return err
 }
 
@@ -310,17 +326,40 @@ func debugInsert() {
 var labelsCopier = prometheus.Labels{"type": "metric", "subsystem": "copier"}
 
 // insertSeries performs the insertion of time-series into the DB.
-func insertSeries(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest) (error, int64) {
+func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, reqs ...copyRequest) (error, int64) {
 	_, span := tracer.Default().Start(ctx, "insert-series")
 	defer span.End()
-	batch := conn.NewBatch()
-
 	numRowsPerInsert := make([]int, 0, len(reqs))
+	insertedRows := make([]int, 0, len(reqs))
 	numRowsTotal := 0
 	totalSamples := 0
 	totalExemplars := 0
+	var sampleRows [][]interface{}
+	var exemplarRows [][]interface{}
+	insertStart := time.Now()
 	lowestEpoch := pgmodel.SeriesEpoch(math.MaxInt64)
 	lowestMinTime := int64(math.MaxInt64)
+	pgConn, err := conn.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("fail to acquire DB connection: %v", err), lowestMinTime
+	}
+	defer func() {
+		if pgConn != nil {
+			pgConn.Release()
+		}
+	}()
+	tx, err := pgConn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start TX for inserting metrics: %v", err), lowestMinTime
+	}
+	defer func() {
+		if err != nil && tx != nil {
+			if err := tx.Rollback(ctx); err != nil {
+				log.Error(err)
+			}
+		}
+	}()
+
 	for r := range reqs {
 		req := &reqs[r]
 		// Since seriesId order is not guaranteed we need to sort it to avoid row deadlock when duplicates are sent (eg. Prometheus retry)
@@ -345,45 +384,24 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest
 		var (
 			hasSamples   bool
 			hasExemplars bool
-
-			timeSamples   []time.Time
-			timeExemplars []time.Time
-
-			valSamples   []float64
-			valExemplars []float64
-
-			seriesIdSamples   []int64
-			seriesIdExemplars []int64
-
-			exemplarLbls [][]string
 		)
 
 		if numSamples > 0 {
-			timeSamples = make([]time.Time, 0, numSamples)
-			valSamples = make([]float64, 0, numSamples)
-			seriesIdSamples = make([]int64, 0, numSamples)
+			sampleRows = make([][]interface{}, 0, numSamples)
 		}
 		if numExemplars > 0 {
-			timeExemplars = make([]time.Time, 0, numExemplars)
-			valExemplars = make([]float64, 0, numExemplars)
-			seriesIdExemplars = make([]int64, 0, numExemplars)
-			exemplarLbls = make([][]string, 0, numExemplars)
+			exemplarRows = make([][]interface{}, 0, numExemplars)
 		}
 
 		visitor := req.data.batch.Visitor()
 		err := visitor.Visit(
 			func(t time.Time, v float64, seriesId int64) {
 				hasSamples = true
-				timeSamples = append(timeSamples, t)
-				valSamples = append(valSamples, v)
-				seriesIdSamples = append(seriesIdSamples, seriesId)
+				sampleRows = append(sampleRows, []interface{}{t, v, seriesId})
 			},
 			func(t time.Time, v float64, seriesId int64, lvalues []string) {
 				hasExemplars = true
-				timeExemplars = append(timeExemplars, t)
-				valExemplars = append(valExemplars, v)
-				seriesIdExemplars = append(seriesIdExemplars, seriesId)
-				exemplarLbls = append(exemplarLbls, lvalues)
+				exemplarRows = append(exemplarRows, []interface{}{t, seriesId, lvalues, v})
 			},
 		)
 		if err != nil {
@@ -403,18 +421,51 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest
 		totalExemplars += numExemplars
 		if hasSamples {
 			numRowsPerInsert = append(numRowsPerInsert, numSamples)
-			batch.Queue("SELECT _prom_catalog.insert_metric_row($1, $2::TIMESTAMPTZ[], $3::DOUBLE PRECISION[], $4::BIGINT[])", req.info.TableName, timeSamples, valSamples, seriesIdSamples)
+			table := pgx.Identifier{req.info.TableSchema, req.info.TableName}
+			if onConflict {
+				table, err = createTempIngestTable(ctx, tx, req.info.TableName, req.info.TableSchema)
+				if err != nil {
+					return err, lowestMinTime
+				}
+			}
+			inserted, err := tx.CopyFrom(ctx, table, schema.PromDataColumns[:], pgx.CopyFromRows(sampleRows))
+			if err != nil {
+				return err, lowestMinTime
+			}
+			if onConflict {
+				res, err := tx.Exec(ctx, fmt.Sprintf(sqlInsertIntoFrom, schema.PromData, pgx.Identifier{req.info.TableName}.Sanitize(),
+					strings.Join(schema.PromDataColumns[:], ","), table.Sanitize()))
+				if err != nil {
+					return err, lowestMinTime
+				}
+				inserted = res.RowsAffected()
+
+			}
+			insertedRows = append(insertedRows, int(inserted))
 		}
 		if hasExemplars {
-			// We cannot send 2-D [][]TEXT to postgres via the pgx.encoder. For this and easier querying reasons, we create a
-			// new type in postgres by the name prom_api.label_value_array and use that type as array (which forms a 2D array of TEXT)
-			// which is then used to push using the unnest method apprach.
-			labelValues := pgmodel.GetCustomType(pgmodel.LabelValueArray)
-			if err := labelValues.Set(exemplarLbls); err != nil {
-				return fmt.Errorf("setting prom_api.label_value_array[] value: %w", err), lowestMinTime
-			}
 			numRowsPerInsert = append(numRowsPerInsert, numExemplars)
-			batch.Queue("SELECT _prom_catalog.insert_exemplar_row($1::NAME, $2::TIMESTAMPTZ[], $3::BIGINT[], $4::prom_api.label_value_array[], $5::DOUBLE PRECISION[])", req.info.TableName, timeExemplars, seriesIdExemplars, labelValues, valExemplars)
+			table := pgx.Identifier{schema.PromDataExemplar, req.info.TableName}
+			if onConflict {
+				table, err = createTempIngestTable(ctx, tx, req.info.TableName, schema.PromDataExemplar)
+				if err != nil {
+					return err, lowestMinTime
+				}
+			}
+			inserted, err := tx.CopyFrom(ctx, table, schema.PromExemplarColumns[:], pgx.CopyFromRows(exemplarRows))
+			if err != nil {
+				return err, lowestMinTime
+			}
+			if onConflict {
+				res, err := tx.Exec(ctx, fmt.Sprintf(sqlInsertIntoFrom, schema.PromDataExemplar, pgx.Identifier{req.info.TableName}.Sanitize(),
+					strings.Join(schema.PromExemplarColumns[:], ","), table.Sanitize()))
+				if err != nil {
+					return err, lowestMinTime
+				}
+				inserted = res.RowsAffected()
+
+			}
+			insertedRows = append(insertedRows, int(inserted))
 		}
 	}
 
@@ -422,42 +473,40 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest
 	//thus we don't need row locking here. Note by doing this check at the end we can
 	//have some wasted work for the inserts before this fails but this is rare.
 	//avoiding an additional loop or memoization to find the lowest epoch ahead of time seems worth it.
-	batch.Queue("SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1", int64(lowestEpoch))
-
-	metrics.IngestorRowsPerBatch.With(labelsCopier).Observe(float64(numRowsTotal))
-	metrics.IngestorInsertsPerBatch.With(labelsCopier).Observe(float64(len(reqs)))
-	start := time.Now()
-	results, err := conn.SendBatch(context.Background(), batch)
-	if err != nil {
+	row := tx.QueryRow(ctx, "SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1", int64(lowestEpoch))
+	var any interface{}
+	if err = row.Scan(any); err != nil {
 		return err, lowestMinTime
 	}
-	defer results.Close()
+
+	if err = tx.Commit(ctx); err != nil {
+		return err, lowestMinTime
+	}
+	metrics.IngestorRowsPerBatch.With(labelsCopier).Observe(float64(numRowsTotal))
+	metrics.IngestorInsertsPerBatch.With(labelsCopier).Observe(float64(len(reqs)))
 
 	var affectedMetrics uint64
-	for _, numRows := range numRowsPerInsert {
-		var insertedRows int64
-		err := results.QueryRow().Scan(&insertedRows)
-		if err != nil {
-			return err, lowestMinTime
-		}
-		numRowsExpected := int64(numRows)
-		if numRowsExpected != insertedRows {
+	for idx, numRows := range numRowsPerInsert {
+		if numRows != insertedRows[idx] {
 			affectedMetrics++
-			registerDuplicates(numRowsExpected - insertedRows)
+			registerDuplicates(int64(numRows - insertedRows[idx]))
 		}
 	}
 	metrics.IngestorItems.With(prometheus.Labels{"type": "metric", "subsystem": "copier", "kind": "sample"}).Add(float64(totalSamples))
 	metrics.IngestorItems.With(prometheus.Labels{"type": "metric", "subsystem": "copier", "kind": "exemplar"}).Add(float64(totalExemplars))
 
-	var val []byte
-	row := results.QueryRow()
-	err = row.Scan(&val)
-	if err != nil {
-		return err, lowestMinTime
-	}
 	reportDuplicates(affectedMetrics)
-	metrics.IngestorInsertDuration.With(prometheus.Labels{"type": "metric", "subsystem": "copier", "kind": "sample"}).Observe(time.Since(start).Seconds())
+	metrics.IngestorInsertDuration.With(prometheus.Labels{"type": "metric", "subsystem": "copier", "kind": "sample"}).Observe(time.Since(insertStart).Seconds())
 	return nil, lowestMinTime
+}
+
+func createTempIngestTable(ctx context.Context, tx pgx.Tx, table, schema string) (pgx.Identifier, error) {
+	var tempTableNameRawString string
+	row := tx.QueryRow(ctx, "SELECT _prom_catalog.create_ingest_temp_table($1, $2)", table, schema)
+	if err := row.Scan(&tempTableNameRawString); err != nil {
+		return nil, err
+	}
+	return pgx.Identifier{tempTableNameRawString}, nil
 }
 
 func insertMetadata(conn pgxconn.PgxConn, reqs []pgmodel.Metadata) (insertedRows uint64, err error) {
